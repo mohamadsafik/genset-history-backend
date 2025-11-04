@@ -1,0 +1,389 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+	"time"
+
+	"cloud.google.com/go/firestore"
+	firebase "firebase.google.com/go"
+	"firebase.google.com/go/messaging"
+	"google.golang.org/api/option"
+)
+
+// Struktur data mentah dari genset (per detik)
+type GensetData struct {
+	Current     float64   `json:"current"`
+	Energy      float64   `json:"energy"`
+	Frequency   float64   `json:"frequency"`
+	PF          float64   `json:"pf"`
+	Power       float64   `json:"power"`
+	Time        string    `json:"time"`
+	Voltage     float64   `json:"voltage"`
+	Battery     float64   `json:"battery"`
+	BatteryCa   float64   `json:"battery_ca"`
+	HosePress   float64   `json:"hose_press"`
+	GasPressure float64   `json:"gas_press"`
+	CreatedAt   time.Time `json:"created_at"`
+	TotalData   int       `json:"count"`
+}
+
+// Struktur ringkasan data per menit (untuk grafik)
+type GensetSummary struct {
+	TimeMinute string    `json:"time_minute"` // contoh: "12:01"
+	AvgVoltage float64   `json:"avg_voltage"`
+	AvgCurrent float64   `json:"avg_current"`
+	AvgPower   float64   `json:"avg_power"`
+	AvgPF      float64   `json:"avg_pf"`
+	AvgFreq    float64   `json:"avg_freq"`
+	Energy     float64   `json:"energy"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// Struktur notifikasi
+type Notification struct {
+	Title     string    `json:"title"`
+	Body      string    `json:"body"`
+	Type      string    `json:"type"`
+	Value     float64   `json:"value"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+var (
+	client      *firestore.Client
+	msgClient   *messaging.Client
+	dataBuffer  []GensetData
+	mu          sync.Mutex
+	lastFlushed time.Time
+)
+
+func main() {
+	ctx := context.Background()
+
+	// 🔑 Load kredensial Firebase
+	sa := option.WithCredentialsFile("serviceFirebase.json")
+
+	// 🔥 Inisialisasi Firebase app (ini yang penting)
+	app, err := firebase.NewApp(ctx, nil, sa)
+	if err != nil {
+		log.Fatalf("Failed to init Firebase App: %v", err)
+	}
+
+	// 📘 Firestore client
+	client, err = app.Firestore(ctx)
+	if err != nil {
+		log.Fatalf("Failed to create Firestore client: %v", err)
+	}
+
+	// 📱 Messaging client
+	msgClient, err = app.Messaging(ctx)
+	if err != nil {
+		log.Fatalf("Failed to create Messaging client: %v", err)
+	}
+
+	defer client.Close()
+
+	// Route HTTP
+	http.HandleFunc("/insert", insertHandler)
+	http.HandleFunc("/history", historyHandler)
+
+	fmt.Println("🚀 Server running at :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// Handler untuk menerima data genset per detik
+func insertHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var data GensetData
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	data.CreatedAt = time.Now()
+
+	// Cek apakah ada kondisi critical
+	checkCritical(data)
+
+	// Masukkan ke buffer
+	mu.Lock()
+	dataBuffer = append(dataBuffer, data)
+	mu.Unlock()
+
+	// Jika sudah 1 menit sejak flush terakhir, lakukan penyimpanan summary
+	if time.Since(lastFlushed) > time.Minute {
+		go flushToFirestore()
+		lastFlushed = time.Now()
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintln(w, "Buffered")
+}
+
+// Flush buffer ke Firestore dalam bentuk summary per menit
+func flushToFirestore() {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(dataBuffer) == 0 {
+		return
+	}
+
+	// Hitung rata-rata
+	var totalV, totalC, totalP, totalPF, totalF, totalE, lastGasPress, lastGasHose, lastBattery, LastBatteryTemp float64
+	for _, d := range dataBuffer {
+		totalV = d.Voltage
+		totalC = d.Current
+		totalP += d.Power
+		totalPF = d.PF
+		totalF = d.Frequency
+		totalE = d.Energy // ambil yang terakhir untuk energi kumulatif
+		lastGasHose = d.HosePress
+		lastGasPress = d.GasPressure
+		lastBattery = d.Battery
+		LastBatteryTemp = d.BatteryCa
+	}
+
+	count := float64(len(dataBuffer))
+	now := time.Now()
+
+	summary := GensetData{
+		Time:        now.Format("15:04"),
+		Voltage:     totalV,
+		Current:     totalC,
+		Power:       totalP,
+		PF:          totalPF,
+		Frequency:   totalF,
+		Energy:      totalE,
+		Battery:     lastBattery,
+		BatteryCa:   LastBatteryTemp,
+		HosePress:   lastGasHose,
+		GasPressure: lastGasPress,
+		CreatedAt:   now,
+		TotalData:   int(count),
+	}
+
+	ctx := context.Background()
+
+	// 🔑 PERUBAHAN UTAMA: Membuat ID dokumen unik hingga menit
+	// Format: YYYY-MM-DD-HH-MM (misal: 2025-10-11-17-40)
+	docID := now.Format("2006-01-02-15-04")
+
+	// Path BARU: genset_history/{YYYY-MM-DD-HH-MM}
+	docRef := client.Collection("genset_history").Doc(docID)
+
+	// Menggunakan Set() untuk menyimpan data.
+	// Ini akan menimpa data jika sudah ada dokumen dengan ID menit yang sama (misalnya, jika fungsi dipanggil dua kali dalam menit yang sama).
+	_, err := docRef.Set(ctx, summary)
+
+	if err != nil {
+		log.Println("❌ Failed to save summary:", err)
+	} else {
+		log.Printf("✅ Saved summary %s (%d samples) to ID: %s\n", now, len(dataBuffer), docID)
+	}
+
+	// Kosongkan buffer setelah tersimpan
+	dataBuffer = nil
+}
+
+// Handler ambil data summary berdasarkan tanggal (misal untuk grafik)
+func historyHandler(w http.ResponseWriter, r *http.Request) {
+	date := r.URL.Query().Get("date")
+	if date == "" {
+		date = time.Now().Format("2006-01-02")
+	}
+
+	ctx := context.Background()
+	docs, err := client.Collection("genset_history").
+		Doc(date).
+		Collection("data").
+		OrderBy("created_at", firestore.Asc).
+		Documents(ctx).
+		GetAll()
+	if err != nil {
+		http.Error(w, "Failed to fetch history", http.StatusInternalServerError)
+		return
+	}
+
+	var results []GensetSummary
+	for _, doc := range docs {
+		var s GensetSummary
+		doc.DataTo(&s)
+		results = append(results, s)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+func checkCritical(data GensetData) {
+	ctx := context.Background()
+	var notifications []Notification // <- simpan semua notif di sini
+
+	// Voltage
+	if data.Voltage < 198 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Tegangan Terlalu Rendah",
+			Body:  fmt.Sprintf("PERINGATAN: Tegangan sekarang %.1f V output di bawah 198V (Undervoltage). Perangkat elektronik bisa rusak.", data.Voltage),
+			Type:  "voltage_low",
+			Value: data.Voltage,
+		})
+	}
+	if data.Voltage > 231 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Tegangan Terlalu Tinggi",
+			Body:  fmt.Sprintf("BAHAYA: Tegangan sekarang %.1f V output melebihi 231V (Overvoltage)! Risiko kerusakan perangkat. Segera kurangi beban.", data.Voltage),
+			Type:  "voltage_high",
+			Value: data.Voltage,
+		})
+	}
+
+	// Gas Pressure
+	if data.GasPressure < 10 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Tekanan Gas Terlalu Rendah",
+			Body:  fmt.Sprintf("PERINGATAN: tekanan gas sekarang %.1f psi di bawah 10 psi. Aliran gas lemah, mesin bisa mati.", data.GasPressure),
+			Type:  "gas_low",
+			Value: data.GasPressure,
+		})
+	}
+	if data.GasPressure > 100 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Tekanan Gas Terlalu Tinggi",
+			Body:  fmt.Sprintf("PERINGATAN: tekanan gas sekarang %.1f psi melebihi 100 psi. Risiko kebocoran tinggi. Periksa regulator!", data.GasPressure),
+			Type:  "gas_high",
+			Value: data.GasPressure,
+		})
+	}
+
+	// Gas hose
+	if data.HosePress < 0.4 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Tekanan Selang Gas Terlalu Rendah",
+			Body:  fmt.Sprintf("PERINGATAN: tekanan selang gas sekarang %.1f psi di bawah 0.4 psi. Aliran gas lemah, mesin bisa mati.", data.GasPressure),
+			Type:  "hose_gas_low",
+			Value: data.GasPressure,
+		})
+	}
+	if data.HosePress > 2.2 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Tekanan Selang Gas Terlalu Tinggi",
+			Body:  fmt.Sprintf("PERINGATAN: tekanan selang gas sekarang %.1f psi melebihi 2.2 psi. Risiko kebocoran tinggi. Periksa regulator!", data.GasPressure),
+			Type:  "hose_gas_high",
+			Value: data.GasPressure,
+		})
+	}
+
+	// Battery Temp
+	if data.BatteryCa < 0.0 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Baterai Terlalu Dingin",
+			Body:  fmt.Sprintf("PERINGATAN: Suhu baterai sekarang %.1f°C di bawah 0°C. Performa baterai mungkin menurun.", data.BatteryCa),
+			Type:  "battery_temp_low",
+			Value: data.BatteryCa,
+		})
+	}
+	if data.BatteryCa > 60.0 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Baterai Terlalu Panas",
+			Body:  fmt.Sprintf("BAHAYA: Suhu baterai sekarang %.1f°C melebihi 60°C! Risiko overheat dan kerusakan permanen.", data.BatteryCa),
+			Type:  "battery_temp_high",
+			Value: data.BatteryCa,
+		})
+	}
+
+	// Battery Level
+	if data.Battery < 20 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Baterai Lemah",
+			Body:  "PERINGATAN: Baterai di bawah 20%. Risiko gagal start tinggi. Segera isi daya.",
+			Type:  "battery_low",
+			Value: data.Battery,
+		})
+	}
+	if data.Battery > 100 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Baterai Error",
+			Body:  "KRITIS: Pembacaan baterai di atas 100%. Terindikasi error pada sensor.",
+			Type:  "battery_error",
+			Value: data.Battery,
+		})
+	}
+
+	// Current
+	if data.Current > 12.3 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Arus Terlalu Tinggi",
+			Body:  fmt.Sprintf("BAHAYA: Arus sekarang %.1f melebihi 12.3 A! Beban berlebih.", data.Current),
+			Type:  "current_high",
+			Value: data.Current,
+		})
+	}
+
+	// Frequency
+	if data.Frequency < 49.5 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Frekuensi Terlalu Rendah",
+			Body:  fmt.Sprintf("PERINGATAN: Frekuensi sekarang %.2f Hz di bawah 49.5 Hz.", data.Frequency),
+			Type:  "freq_low",
+			Value: data.Frequency,
+		})
+	}
+	if data.Frequency > 50.5 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Frekuensi Terlalu Tinggi",
+			Body:  fmt.Sprintf("PERINGATAN: Frekuensi sekarang %.2f Hz di atas 50.5 Hz.", data.Frequency),
+			Type:  "freq_high",
+			Value: data.Frequency,
+		})
+	}
+
+	// Power
+	if data.Power > 2200 {
+		notifications = append(notifications, Notification{
+			Title: "⚠️ Daya Terlalu Tinggi",
+			Body:  fmt.Sprintf("BAHAYA: Daya %.1f melebihi 2200 W! Beban berlebih (Overload).", data.Power),
+			Type:  "power_high",
+			Value: data.Power,
+		})
+	}
+
+	// Kirim semua notifikasi yang terkumpul
+	for _, n := range notifications {
+		n.CreatedAt = time.Now()
+		go saveNotification(ctx, n)
+		go sendNotification(ctx, n)
+	}
+}
+
+// Simpan notifikasi ke Firestore
+func saveNotification(ctx context.Context, notif Notification) {
+	_, _, err := client.Collection("notifications").Add(ctx, notif)
+	if err != nil {
+		log.Printf("❌ Gagal simpan notifikasi: %v", err)
+	}
+}
+
+// Kirim notifikasi ke topic all_users
+func sendNotification(ctx context.Context, notif Notification) {
+	message := &messaging.Message{
+		Topic: "all_users",
+		Notification: &messaging.Notification{
+			Title: notif.Title,
+			Body:  notif.Body,
+		},
+	}
+
+	_, err := msgClient.Send(ctx, message)
+	if err != nil {
+		log.Printf("❌ Gagal kirim FCM: %v", err)
+	} else {
+		log.Printf("✅ Notifikasi terkirim: %s", notif.Title)
+	}
+}

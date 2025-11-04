@@ -1,0 +1,93 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"time"
+
+	"cloud.google.com/go/firestore"
+	"google.golang.org/api/option"
+)
+
+// Struct sesuai data genset
+type GensetData struct {
+	Current   float64   `json:"current"`
+	Energy    float64   `json:"energy"`
+	Frequency float64   `json:"frequency"`
+	PF        float64   `json:"pf"`
+	Power     float64   `json:"power"`
+	Time      string    `json:"time"`
+	Voltage   float64   `json:"voltage"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+var client *firestore.Client
+
+func main() {
+	ctx := context.Background()
+
+	// 🔑 Ganti dengan serviceAccountKey.json hasil download dari Firebase Console
+	sa := option.WithCredentialsFile("serviceFirebase.json")
+	var err error
+	client, err = firestore.NewClient(ctx, "tes-1-9ee0c", sa)
+	if err != nil {
+		log.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	http.HandleFunc("/insert", insertHandler)
+	http.HandleFunc("/history", historyHandler)
+
+	fmt.Println("Server running at :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// Handler insert data genset
+func insertHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var data GensetData
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	data.CreatedAt = time.Now() // Tambahkan created_at
+
+	ctx := context.Background()
+	_, _, err := client.Collection("genset_history").Add(ctx, data)
+	if err != nil {
+		http.Error(w, "Failed to insert data", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	fmt.Fprintln(w, "Data inserted successfully")
+}
+
+// Handler ambil 10 terakhir
+func historyHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+	docs, err := client.Collection("genset_history").
+		OrderBy("created_at", firestore.Desc).
+		Limit(10).
+		Documents(ctx).
+		GetAll()
+	if err != nil {
+		http.Error(w, "Failed to fetch history", http.StatusInternalServerError)
+		return
+	}
+
+	var results []map[string]interface{}
+	for _, doc := range docs {
+		results = append(results, doc.Data())
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
